@@ -63,71 +63,75 @@ adapter.on_turn_error = on_error
 # Formatting helpers
 # --------------------------------------------------
 
-def escape_telegram(text: str) -> str:
-    """
-    Escape Telegram MarkdownV2 special characters.
+def clean_response(text: str) -> str:
+    text = text.strip()
 
-    Telegram MarkdownV2 reserved chars:
-    _ * [ ] ( ) ~ ` > # + - = | { } . !
-    Backslash itself must also be escaped first.
-    """
+    # Remove markdown
+    text = re.sub(r"\*\*(.*?)\*\*", r"\1", text)
+    text = re.sub(r"\*(.*?)\*", r"\1", text)
+
+    # Remove ALL escape chars
+    text = re.sub(r"\\+", "", text)
+
+    # Fix bullets → new line
+    text = re.sub(r"\s*•\s*", "\n   • ", text)
+
+    # Force new line before numbering
+    text = re.sub(r"(?<!\n)(\d+\.)", r"\n\1", text)
+
+    # Add spacing between items
+    text = re.sub(r"(\n\d+\..*?)(?=\n\d+\.|\Z)", r"\1\n", text, flags=re.S)
+
+    # Remove intro line (optional)
+    text = re.sub(r"Here are .*?:\s*", "", text, flags=re.IGNORECASE)
+
+    # Clean extra spaces
+    text = re.sub(r"\n{2,}", "\n\n", text)
+
+    return text.strip()
+
+def strip_markdown(text: str) -> str:
     if not text:
         return ""
 
-    # Escape backslash first
-    text = text.replace("\\", "\\\\")
+    # Remove bold/italic markers
+    text = re.sub(r"\*\*(.*?)\*\*", r"\1", text)
+    text = re.sub(r"\*(.*?)\*", r"\1", text)
 
-    # Escape every other MarkdownV2 special character
-    return re.sub(r'([_*[\]()~`>#+\-=|{}.!])', r'\\\1', text)
+    # Remove markdown list dashes
+    text = re.sub(r"^\s*-\s*", "• ", text, flags=re.MULTILINE)
 
+    # Remove problematic characters for Telegram parsing
+    text = re.sub(r"[\\_*[\]()~`>#+\-=|{}.!]", "", text)
+
+    return text
 
 def beautify_reply(reply: str) -> str:
-    """
-    Format recommendation text, then escape the ENTIRE final message
-    for Telegram MarkdownV2.
-    """
+    logger.debug(f"[RAW REPLY] {repr(reply)}")
+
     if not reply or not reply.strip():
-        final_message = (
+        return (
             "🎬 Your Movie Recommendations\n\n"
             "No results found.\n\n"
             "🍿 Enjoy your movie night!"
         )
-        return escape_telegram(final_message)
 
     text = reply.strip()
 
-    # Normalize line endings
+    # Normalize
     text = re.sub(r"\r\n|\r", "\n", text)
 
-    # Remove markdown emphasis markers from model output
-    text = re.sub(r"\*\*(.*?)\*\*", r"\1", text)
-    text = re.sub(r"(?<!\*)\*(?!\*)(.*?)(?<!\*)\*(?!\*)", r"\1", text)
+    # 🔥 CRITICAL: strip markdown + unsafe chars
+    text = strip_markdown(text)
 
-    # Remove any pre-existing escaping from model output so we can re-escape cleanly
-    text = text.replace("\\", "")
+    logger.debug(f"[CLEAN TEXT] {repr(text)}")
 
-    # Put each numbered item on a fresh block
-    text = re.sub(r"\s*(\d+\.)\s*", r"\n\1 ", text)
-
-    # Put helper lines on their own lines
-    text = re.sub(r"\s*Matches because\b", r"\nMatches because", text)
-    text = re.sub(r"\s*Family-friendly:", r"\nFamily-friendly:", text)
-
-    # Clean leading/trailing whitespace per line
-    lines = [line.strip() for line in text.split("\n")]
-    text = "\n".join(lines)
-
-    # Collapse excessive blank lines
-    text = re.sub(r"\n{3,}", "\n\n", text).strip()
-
-    final_message = (
+    return (
         "🎬 Your Movie Recommendations\n\n"
         f"{text}\n\n"
         "🍿 Enjoy your movie night!"
     )
 
-    # CRITICAL: escape the full final message last
-    return escape_telegram(final_message)
 
 def welcome_message() -> str:
     return (
@@ -146,6 +150,35 @@ def welcome_message() -> str:
 # --------------------------------------------------
 # Attachment helpers
 # --------------------------------------------------
+import subprocess
+
+def convert_ogg_to_wav(input_path: str) -> str:
+    output_path = input_path.replace(".ogg", ".wav")
+
+    result = subprocess.run(
+        [
+            "ffmpeg",
+            "-y",
+            "-i", input_path,
+            "-ac", "1",
+            "-ar", "16000",
+            "-sample_fmt", "s16",
+            output_path,
+        ],
+        capture_output=True,
+        text=True,
+    )
+
+    print("FFMPEG STDOUT:", result.stdout)
+    print("FFMPEG STDERR:", result.stderr)
+
+    if result.returncode != 0:
+        raise Exception("FFmpeg conversion failed")
+
+    if not os.path.exists(output_path) or os.path.getsize(output_path) == 0:
+        raise Exception("WAV file not created properly")
+
+    return output_path
 
 def download_attachment(content_url: str, file_suffix: str) -> str:
     """
@@ -233,19 +266,10 @@ class MovieRecommendationBot:
         print(f"[PREFS] {prefs}")
 
         reply = get_movie_recommendations(prefs)
-
         formatted_reply = beautify_reply(reply)
 
-        # DEBUG (optional but useful)
-        print("FINAL TELEGRAM TEXT:", repr(formatted_reply))
+        await turn_context.send_activity(formatted_reply)
 
-        await turn_context.send_activity(
-            Activity(
-                type=ActivityTypes.message,
-                text=formatted_reply,
-                channel_data={"parse_mode": "MarkdownV2"}
-            )
-)
     async def handle_attachment(
         self,
         turn_context: TurnContext,
@@ -321,9 +345,11 @@ class MovieRecommendationBot:
         logger.info("Processing audio attachment")
         print("[VOICE] Processing audio attachment")
 
-        audio_path = download_attachment(content_url, ".wav")
+        audio_path = download_attachment(content_url, ".ogg")
 
-        transcript = transcribe_audio_file(audio_path)
+        wav_path = convert_ogg_to_wav(audio_path)
+
+        transcript = transcribe_audio_file(wav_path)
 
         logger.info(f"Transcript: {transcript}")
         print(f"[TRANSCRIPT] {transcript}")
