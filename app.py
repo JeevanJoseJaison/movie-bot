@@ -6,6 +6,10 @@ import tempfile
 import requests
 from dotenv import load_dotenv
 from flask import Flask, request, Response
+from botbuilder.core import BotFrameworkAdapterSettings, TurnContext
+from botbuilder.core.integration import aiohttp_error_middleware
+from botbuilder.integration.aiohttp import BotFrameworkHttpAdapter
+from botbuilder.schema import Activity
 
 from botbuilder.core import (
     BotFrameworkAdapter,
@@ -33,46 +37,97 @@ logger = logging.getLogger(__name__)
 
 load_dotenv()
 
-MICROSOFT_APP_ID = os.getenv("MicrosoftAppId", "")
-MICROSOFT_APP_PASSWORD = os.getenv("MicrosoftAppPassword", "")
 
 app = Flask(__name__)
 
-adapter_settings = BotFrameworkAdapterSettings(
-    MICROSOFT_APP_ID,
-    MICROSOFT_APP_PASSWORD,
-)
+MICROSOFT_APP_ID=os.getenv("MICROSOFT_APP_ID", "4fa6cf41-1608-49de-9cf1-0bb4aff1f592")
+MICROSOFT_APP_PASSWORD=os.getenv("MICROSOFT_APP_PASSWORD")
+MICROSOFT_APP_TENANT_ID=os.getenv("MICROSOFT_APP_TENANT_ID", "d02378ec-1688-46d5-8540-1c28b5f470f6")
 
-adapter = BotFrameworkAdapter(adapter_settings)
+logger.info(f"MICROSOFT_APP_ID : {MICROSOFT_APP_ID}")
+logger.info(f"MICROSOFT_APP_PASSWORD : {MICROSOFT_APP_PASSWORD}")
+logger.info(f"MICROSOFT_APP_TENANT_ID : {MICROSOFT_APP_TENANT_ID}")
 
 
+adapter_settings = BotFrameworkAdapterSettings(MICROSOFT_APP_ID, MICROSOFT_APP_PASSWORD)
+adapter_settings.channel_auth_tenant = MICROSOFT_APP_TENANT_ID
+
+adapter = BotFrameworkHttpAdapter(adapter_settings)
+
+async def on_error(context: TurnContext, error: Exception):
+    logger.exception("Bot turn error")
+    await context.send_activity("Sorry, something went wrong.")
+
+adapter.on_turn_error = on_error
 # --------------------------------------------------
 # Formatting helpers
 # --------------------------------------------------
 
-def markdown_to_telegram_style(text: str) -> str:
+def escape_telegram(text: str) -> str:
     """
-    Keeps text clean for Telegram through Azure Bot Service.
-    Bot Framework channel rendering can differ, so this avoids broken formatting.
+    Escape Telegram MarkdownV2 special characters.
+
+    Telegram MarkdownV2 reserved chars:
+    _ * [ ] ( ) ~ ` > # + - = | { } . !
+    Backslash itself must also be escaped first.
     """
-    text = text.strip()
+    if not text:
+        return ""
 
-    # Remove excessive markdown if model returns it inconsistently
-    text = re.sub(r"\*\*(.*?)\*\*", r"\1", text)
-    text = re.sub(r"(?<!\*)\*(?!\*)(.*?)(?<!\*)\*(?!\*)", r"\1", text)
+    # Escape backslash first
+    text = text.replace("\\", "\\\\")
 
-    return text
+    # Escape every other MarkdownV2 special character
+    return re.sub(r'([_*[\]()~`>#+\-=|{}.!])', r'\\\1', text)
 
 
 def beautify_reply(reply: str) -> str:
-    formatted = markdown_to_telegram_style(reply)
+    """
+    Format recommendation text, then escape the ENTIRE final message
+    for Telegram MarkdownV2.
+    """
+    if not reply or not reply.strip():
+        final_message = (
+            "🎬 Your Movie Recommendations\n\n"
+            "No results found.\n\n"
+            "🍿 Enjoy your movie night!"
+        )
+        return escape_telegram(final_message)
 
-    return (
+    text = reply.strip()
+
+    # Normalize line endings
+    text = re.sub(r"\r\n|\r", "\n", text)
+
+    # Remove markdown emphasis markers from model output
+    text = re.sub(r"\*\*(.*?)\*\*", r"\1", text)
+    text = re.sub(r"(?<!\*)\*(?!\*)(.*?)(?<!\*)\*(?!\*)", r"\1", text)
+
+    # Remove any pre-existing escaping from model output so we can re-escape cleanly
+    text = text.replace("\\", "")
+
+    # Put each numbered item on a fresh block
+    text = re.sub(r"\s*(\d+\.)\s*", r"\n\1 ", text)
+
+    # Put helper lines on their own lines
+    text = re.sub(r"\s*Matches because\b", r"\nMatches because", text)
+    text = re.sub(r"\s*Family-friendly:", r"\nFamily-friendly:", text)
+
+    # Clean leading/trailing whitespace per line
+    lines = [line.strip() for line in text.split("\n")]
+    text = "\n".join(lines)
+
+    # Collapse excessive blank lines
+    text = re.sub(r"\n{3,}", "\n\n", text).strip()
+
+    final_message = (
         "🎬 Your Movie Recommendations\n\n"
-        f"{formatted}\n\n"
+        f"{text}\n\n"
         "🍿 Enjoy your movie night!"
     )
 
+    # CRITICAL: escape the full final message last
+    return escape_telegram(final_message)
 
 def welcome_message() -> str:
     return (
@@ -178,10 +233,19 @@ class MovieRecommendationBot:
         print(f"[PREFS] {prefs}")
 
         reply = get_movie_recommendations(prefs)
+
         formatted_reply = beautify_reply(reply)
 
-        await turn_context.send_activity(formatted_reply)
+        # DEBUG (optional but useful)
+        print("FINAL TELEGRAM TEXT:", repr(formatted_reply))
 
+        await turn_context.send_activity(
+            Activity(
+                type=ActivityTypes.message,
+                text=formatted_reply,
+                channel_data={"parse_mode": "MarkdownV2"}
+            )
+)
     async def handle_attachment(
         self,
         turn_context: TurnContext,
