@@ -1,0 +1,4 @@
+{
+    "appService.defaultWebAppToDeploy": "/subscriptions/55509666-1066-46c9-9665-d05da31d58ed/resourceGroups/task6-rg/providers/Microsoft.Web/sites/movie-recommend-task8",
+    "appService.deploySubpath": "."
+}
